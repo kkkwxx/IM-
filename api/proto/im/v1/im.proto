@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package im.v1;
+
+option go_package = "im/api/imv1";
+
+// Envelope 是系统内唯一的数据契约：
+// 客户端 WebSocket 二进制帧、gateway->logic、logic->gateway 推送，全部复用同一消息。
+message Envelope {
+  string msg_id = 1;        // 客户端生成（crypto/rand），M2 用于幂等去重
+  MsgType type = 2;
+  string from = 3;          // 发送者 uid；gateway 强制改写为连接身份，防伪造
+  string to = 4;            // 接收者 uid（M4 群聊时为 conversation_id）
+  string content = 5;
+  int64 timestamp_ms = 6;   // logic 填服务器时间；仅展示用，不做排序依据（排序靠 M2 的 seq）
+  uint32 hop = 7;           // [M5 预留] agent 防循环跳数，M1 起透传
+  uint64 seq = 8;           // 会话级单调递增序号；logic 落库后填写，客户端据此推进同步水位
+}
+
+enum MsgType {
+  MSG_TYPE_UNSPECIFIED = 0;
+  MSG_TYPE_TEXT = 1;
+  MSG_TYPE_SYSTEM = 2;      // 服务端通知（如对方离线），不参与会话存储
+}
+
+// Logic：业务层。gateway 收到客户端消息后调用。
+service Logic {
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+  rpc Sync(SyncRequest) returns (SyncResponse);
+}
+
+message SendMessageRequest {
+  Envelope envelope = 1;
+}
+
+message SendMessageResponse {
+  string msg_id = 1;
+  bool delivered = 2;       // 对方是否在线且推送成功；false 不影响可靠性（已落库，靠 seq 同步兜底）
+  uint64 seq = 3;           // 落库分配的会话级序号；幂等重试返回原 seq
+}
+
+// Gateway：接入层推送服务。logic 决定接收者后调用。
+// M1 单实例直连；M3 起由 Redis 路由表决定目标 gateway 实例。
+service Gateway {
+  rpc Push(PushRequest) returns (PushResponse);
+}
+
+message PushRequest {
+  string user_id = 1;
+  Envelope envelope = 2;
+}
+
+message PushResponse {
+  bool delivered = 1;
+}
+
+// Frame 是客户端 WS 二进制帧的唯一格式：oneof 保证一帧只有一种载荷。
+message Frame {
+  oneof payload {
+    Envelope message = 1;
+    SyncRequest sync_req = 2;
+    SyncResponse sync_resp = 3;
+  }
+}
+
+// 增量同步：拉取会话中 seq > since 的消息，游标分页。
+message SyncRequest {
+  string conv_id = 1;
+  uint64 since = 2;         // 客户端水位：已覆盖到的最大 seq
+  uint32 limit = 3;         // 期望条数；服务端钳制（0=默认100，上限200）
+  string user_id = 4;       // gateway 强制改写为连接身份，logic 据此做会话成员校验
+}
+
+message SyncResponse {
+  string conv_id = 1;
+  repeated Envelope messages = 2;  // 按 seq 升序
+  bool has_more = 3;               // true=还有下一页，客户端应以本批最大 seq 继续拉
+}
