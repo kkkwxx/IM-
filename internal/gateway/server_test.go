@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,8 +17,61 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"im/api/imv1"
+	"im/internal/auth"
 	"im/internal/config"
 )
+
+var testSecret = []byte("test-secret")
+
+func testToken(t *testing.T, uid string) string {
+	t.Helper()
+	tok, err := auth.IssueAccessToken(uid, testSecret, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+// fakeRoutes 内存版路由表，记录登记/删除，可注入登记失败。
+type fakeRoutes struct {
+	mu           sync.Mutex
+	entries      map[string]string // uid|connID → gwAddr
+	failRegister bool
+}
+
+func newFakeRoutes() *fakeRoutes { return &fakeRoutes{entries: map[string]string{}} }
+
+func (f *fakeRoutes) Register(ctx context.Context, uid, connID, gwAddr string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failRegister {
+		return errors.New("redis down")
+	}
+	f.entries[uid+"|"+connID] = gwAddr
+	return nil
+}
+
+func (f *fakeRoutes) Renew(ctx context.Context, uid, connID, gwAddr string) error {
+	return f.Register(ctx, uid, connID, gwAddr)
+}
+
+func (f *fakeRoutes) Remove(ctx context.Context, uid, connID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, uid+"|"+connID)
+	return nil
+}
+
+func (f *fakeRoutes) has(uid string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.entries {
+		if strings.HasPrefix(k, uid+"|") {
+			return true
+		}
+	}
+	return false
+}
 
 // loopbackLogic 模拟 logic+Push 回路：领 seq 后投递给本 hub 上的接收者。
 // 用它隔离测试 gateway 的 WS 接入与推送链路，不依赖真实 logic 进程。
@@ -30,10 +85,13 @@ type loopbackLogic struct {
 func (l *loopbackLogic) SendMessage(ctx context.Context, in *imv1.SendMessageRequest, opts ...grpc.CallOption) (*imv1.SendMessageResponse, error) {
 	env := proto.Clone(in.Envelope).(*imv1.Envelope)
 	env.Seq = l.seq.Add(1)
+	// 模拟真实 fanout：接收方 + 发送方双方扇出（发送设备会收到回执+副本，客户端按 seq 去重）
+	delivered := l.h.deliver(env.To, env)
+	l.h.deliver(env.From, env)
 	return &imv1.SendMessageResponse{
 		MsgId:     env.MsgId,
 		Seq:       env.Seq,
-		Delivered: l.h.deliver(env.To, env),
+		Delivered: delivered,
 	}, nil
 }
 
@@ -50,7 +108,7 @@ func (l *loopbackLogic) Sync(ctx context.Context, in *imv1.SyncRequest, opts ...
 
 func dialTestClient(t *testing.T, srvURL, userID string) *websocket.Conn {
 	t.Helper()
-	u := "ws" + strings.TrimPrefix(srvURL, "http") + "/ws?user_id=" + userID
+	u := "ws" + strings.TrimPrefix(srvURL, "http") + "/ws?token=" + testToken(t, userID)
 	ws, _, err := websocket.DefaultDialer.Dial(u, nil)
 	if err != nil {
 		t.Fatalf("dial %s: %v", userID, err)
@@ -93,7 +151,7 @@ func readFrame(t *testing.T, ws *websocket.Conn) *imv1.Frame {
 }
 
 func TestEndToEndSingleChat(t *testing.T) {
-	s := NewServer(config.Gateway{}, nil)
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
 	s.logic = &loopbackLogic{h: s.hub}
 	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
 	t.Cleanup(srv.Close)
@@ -109,9 +167,12 @@ func TestEndToEndSingleChat(t *testing.T) {
 	if got.Seq == 0 {
 		t.Fatal("pushed message must carry seq")
 	}
-	ack := readEnv(t, alice)
-	if ack.From != "alice" || ack.MsgId != got.MsgId || ack.Seq != got.Seq {
-		t.Fatalf("alice ack should echo her message with same seq, got %+v", ack)
+	// M3 多端同步：发送设备收到本地回执 + 扇出副本，两帧同 msg_id 同 seq（客户端按 seq 去重）
+	for i := range 2 {
+		echo := readEnv(t, alice)
+		if echo.From != "alice" || echo.MsgId != got.MsgId || echo.Seq != got.Seq {
+			t.Fatalf("alice echo %d should carry her message with same seq, got %+v", i, echo)
+		}
 	}
 
 	sendText(t, bob, "bob", "alice", "hi alice")
@@ -122,7 +183,7 @@ func TestEndToEndSingleChat(t *testing.T) {
 }
 
 func TestOfflineSendGetsAckWithSeq(t *testing.T) {
-	s := NewServer(config.Gateway{}, nil)
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
 	s.logic = &loopbackLogic{h: s.hub}
 	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
 	t.Cleanup(srv.Close)
@@ -138,7 +199,7 @@ func TestOfflineSendGetsAckWithSeq(t *testing.T) {
 }
 
 func TestFromIsForcedToConnIdentity(t *testing.T) {
-	s := NewServer(config.Gateway{}, nil)
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
 	s.logic = &loopbackLogic{h: s.hub}
 	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
 	t.Cleanup(srv.Close)
@@ -155,7 +216,7 @@ func TestFromIsForcedToConnIdentity(t *testing.T) {
 }
 
 func TestSyncRoundTripForcesIdentity(t *testing.T) {
-	s := NewServer(config.Gateway{}, nil)
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
 	lb := &loopbackLogic{h: s.hub}
 	s.logic = lb
 	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
@@ -181,5 +242,131 @@ func TestSyncRoundTripForcesIdentity(t *testing.T) {
 	defer lb.mu.Unlock()
 	if len(lb.syncReq) != 1 || lb.syncReq[0].UserId != "alice" {
 		t.Fatalf("sync user_id must be forced to alice, got %+v", lb.syncReq)
+	}
+}
+
+func TestHandshakeRejectsInvalidToken(t *testing.T) {
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
+	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
+	t.Cleanup(srv.Close)
+	base := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+
+	for _, u := range []string{
+		base,                       // 无 token
+		base + "?token=garbage",    // 非法格式
+		base + "?token=" + testToken(t, "alice") + "x", // 篡改签名
+	} {
+		_, resp, err := websocket.DefaultDialer.Dial(u, nil)
+		if err == nil {
+			t.Fatalf("dial %s should fail", u)
+		}
+		if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("want 401 for %s, got resp=%v err=%v", u, resp, err)
+		}
+	}
+}
+
+func TestIdentityComesFromTokenNotQuery(t *testing.T) {
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
+	s.logic = &loopbackLogic{h: s.hub}
+	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
+	t.Cleanup(srv.Close)
+
+	// token 身份是 alice，query 里塞 user_id=mallory 必须被无视
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + testToken(t, "alice") + "&user_id=mallory"
+	alice, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { alice.Close() })
+	bob := dialTestClient(t, srv.URL, "bob")
+
+	sendText(t, alice, "mallory", "bob", "who am i")
+	if got := readEnv(t, bob); got.From != "alice" {
+		t.Fatalf("identity must come from token (alice), got %q", got.From)
+	}
+}
+
+// waitForRoute 轮询 fakeRoutes 直到条件满足（登记/删除发生在握手后的 goroutine 里，异步）。
+func waitForRoute(t *testing.T, fr *fakeRoutes, uid string, want bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for fr.has(uid) != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("route entry for %s: want present=%v, timed out", uid, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRouteLifecycleRegisteredAndRemoved(t *testing.T) {
+	fr := newFakeRoutes()
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, fr, nil)
+	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
+	t.Cleanup(srv.Close)
+
+	alice := dialTestClient(t, srv.URL, "alice")
+	waitForRoute(t, fr, "alice", true)
+
+	alice.Close()
+	waitForRoute(t, fr, "alice", false)
+}
+
+func TestRouteRegisterFailureRejectsConn(t *testing.T) {
+	fr := newFakeRoutes()
+	fr.failRegister = true
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, fr, nil)
+	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
+	t.Cleanup(srv.Close)
+
+	// 握手（upgrade）先于路由登记，dial 会成功；登记失败后服务端必须立即断开
+	u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + testToken(t, "alice")
+	ws, _, err := websocket.DefaultDialer.Dial(u, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ws.Close() })
+
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _, err = ws.ReadMessage()
+	if err == nil {
+		t.Fatal("server must close conn when route register fails")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("conn still open after register failure (read timed out instead of closed)")
+	}
+}
+
+func TestMultiDeviceFanout(t *testing.T) {
+	s := NewServer(config.Gateway{Addr: "test-gw"}, nil, testSecret, newFakeRoutes(), nil)
+	s.logic = &loopbackLogic{h: s.hub}
+	srv := httptest.NewServer(http.HandlerFunc(s.handleWS))
+	t.Cleanup(srv.Close)
+
+	alice1 := dialTestClient(t, srv.URL, "alice")
+	alice2 := dialTestClient(t, srv.URL, "alice")
+	bob := dialTestClient(t, srv.URL, "bob")
+
+	// 接收方多端：bob 发给 alice，alice 两台设备都要收到
+	sendText(t, bob, "bob", "alice", "to both devices")
+	for i, ws := range []*websocket.Conn{alice1, alice2} {
+		got := readEnv(t, ws)
+		if got.From != "bob" || got.Content != "to both devices" || got.Seq == 0 {
+			t.Fatalf("alice device %d got %+v", i, got)
+		}
+	}
+	// 发送方 bob 自己也收到两帧：本地回执 + 扇出副本（同 seq，客户端去重），先消费掉
+	for i := range 2 {
+		if echo := readEnv(t, bob); echo.Content != "to both devices" || echo.Seq == 0 {
+			t.Fatalf("bob echo %d wrong: %+v", i, echo)
+		}
+	}
+
+	// 发送方多端：alice 设备1 发出，设备2 要收到同 seq 的同步副本
+	sendText(t, alice1, "alice", "bob", "from dev1")
+	got := readEnv(t, bob)
+	echo := readEnv(t, alice2)
+	if echo.MsgId != got.MsgId || echo.Seq != got.Seq || echo.Content != "from dev1" {
+		t.Fatalf("alice dev2 should sync sender's message, got %+v (bob got %+v)", echo, got)
 	}
 }

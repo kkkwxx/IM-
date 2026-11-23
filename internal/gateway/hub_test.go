@@ -67,7 +67,7 @@ func TestHubRemoveOnlySelf(t *testing.T) {
 	c1 := testConn(t, "alice")
 	c2 := testConn(t, "alice")
 	h.register(c1)
-	h.register(c2) // 踢旧登录
+	h.register(c2) // 多端共存
 
 	// c1 的读泵退出时可能调用 remove，但不能误删 c2
 	h.remove("alice", c1)
@@ -84,17 +84,31 @@ func TestHubRemoveOnlySelf(t *testing.T) {
 	}
 }
 
-func TestHubReplaceKicksOld(t *testing.T) {
+// M3 多端同步：同 uid 多设备共存，deliver 扇出到每台设备，不再踢旧登录。
+func TestHubMultiDeviceCoexist(t *testing.T) {
 	h := newHub()
 	c1 := testConn(t, "alice")
 	c2 := testConn(t, "alice")
 	h.register(c1)
 	h.register(c2)
 
-	select {
-	case <-c1.closeCh:
-	default:
-		t.Fatal("old connection should be shut down")
+	if !h.deliver("alice", &imv1.Envelope{MsgId: "m2"}) {
+		t.Fatal("deliver should succeed")
+	}
+	for i, c := range []*conn{c1, c2} {
+		select {
+		case got := <-c.sendCh:
+			if got.GetMessage().GetMsgId() != "m2" {
+				t.Fatalf("device %d got %q, want m2", i, got.GetMessage().GetMsgId())
+			}
+		default:
+			t.Fatalf("device %d should receive the fanout", i)
+		}
+		select {
+		case <-c.closeCh:
+			t.Fatalf("device %d must not be shut down", i)
+		default:
+		}
 	}
 }
 

@@ -39,19 +39,11 @@ message SendMessageResponse {
   uint64 seq = 3;           // 落库分配的会话级序号；幂等重试返回原 seq
 }
 
-// Gateway：接入层推送服务。logic 决定接收者后调用。
-// M1 单实例直连；M3 起由 Redis 路由表决定目标 gateway 实例。
-service Gateway {
-  rpc Push(PushRequest) returns (PushResponse);
-}
-
+// PushRequest 是 logic→gateway 的推送载荷（M3 起经 Redis Pub/Sub 定向频道传输，
+// 复用 protobuf 契约，与 WS 帧零转换）。user_id 指明本实例上要扇出的目标用户。
 message PushRequest {
   string user_id = 1;
   Envelope envelope = 2;
-}
-
-message PushResponse {
-  bool delivered = 1;
 }
 
 // Frame 是客户端 WS 二进制帧的唯一格式：oneof 保证一帧只有一种载荷。

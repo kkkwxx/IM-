@@ -1,0 +1,15 @@
+{
+  "gateway": {
+    "ws_addr": "127.0.0.1:8083",
+    "addr": "gw-2",
+    "logic_grpc_addr": "127.0.0.1:9002",
+    "redis_addr": "127.0.0.1:6379"
+  },
+  "logic": {
+    "grpc_addr": "127.0.0.1:9002",
+    "http_addr": "127.0.0.1:8082",
+    "mysql_dsn": "root:imdev123@tcp(127.0.0.1:3306)/im?parseTime=true&charset=utf8mb4",
+    "redis_addr": "127.0.0.1:6379"
+  },
+  "jwt_secret": "dev-only-secret-change-me"
+}

@@ -5,18 +5,21 @@ import (
 	"flag"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/redis/go-redis/v9"
 
-	"im/api/imv1"
+	"im/internal/auth"
 	"im/internal/config"
 	"im/internal/logic"
+	"im/internal/pubsub"
+	"im/internal/route"
 	"im/internal/seq"
 	"im/internal/store"
 )
@@ -32,16 +35,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// [PRODUCTION NOTE] M3 起 gateway 地址不再写死在配置里，
-	// 而是查 Redis 全局路由表得到接收者所在实例，再定向 Push。
-	gwConn, err := grpc.NewClient(cfg.Logic.GatewayGRPCAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		slog.Error("dial gateway", "err", err)
-		os.Exit(1)
-	}
-	defer gwConn.Close()
-
 	st, err := store.Open(context.Background(), cfg.Logic.MySQLDSN)
 	if err != nil {
 		slog.Error("open mysql", "err", err)
@@ -56,6 +49,8 @@ func main() {
 		os.Exit(1)
 	}
 	alloc := seq.NewAllocator(rdb, st)
+	routes := route.New(rdb, route.DefaultTTL)
+	pub := pubsub.NewRedisPublisher(rdb)
 
 	lis, err := net.Listen("tcp", cfg.Logic.GRPCAddr)
 	if err != nil {
@@ -63,13 +58,29 @@ func main() {
 		os.Exit(1)
 	}
 	grpcSrv := grpc.NewServer()
-	logic.Register(grpcSrv, imv1.NewGatewayClient(gwConn), st, alloc)
+	logic.Register(grpcSrv, st, alloc, routes, pub)
+
+	// 鉴权 HTTP：register/login/refresh 是一次性请求，与 gRPC 并列暴露
+	httpSrv := &http.Server{
+		Addr:    cfg.Logic.HTTPAddr,
+		Handler: auth.NewHandlers(st, []byte(cfg.JWTSecret)).Routes(),
+	}
+	go func() {
+		slog.Info("auth http started", "addr", cfg.Logic.HTTPAddr)
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("http serve", "err", err)
+			os.Exit(1)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go func() {
 		<-ctx.Done()
 		grpcSrv.GracefulStop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		httpSrv.Shutdown(shutdownCtx)
 	}()
 
 	slog.Info("logic started", "grpc", cfg.Logic.GRPCAddr)

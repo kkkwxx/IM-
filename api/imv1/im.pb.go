@@ -276,6 +276,8 @@ func (x *SendMessageResponse) GetSeq() uint64 {
 	return 0
 }
 
+// PushRequest 是 logic→gateway 的推送载荷（M3 起经 Redis Pub/Sub 定向频道传输，
+// 复用 protobuf 契约，与 WS 帧零转换）。user_id 指明本实例上要扇出的目标用户。
 type PushRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	UserId        string                 `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
@@ -328,50 +330,6 @@ func (x *PushRequest) GetEnvelope() *Envelope {
 	return nil
 }
 
-type PushResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Delivered     bool                   `protobuf:"varint,1,opt,name=delivered,proto3" json:"delivered,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PushResponse) Reset() {
-	*x = PushResponse{}
-	mi := &file_im_v1_im_proto_msgTypes[4]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PushResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PushResponse) ProtoMessage() {}
-
-func (x *PushResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_im_v1_im_proto_msgTypes[4]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PushResponse.ProtoReflect.Descriptor instead.
-func (*PushResponse) Descriptor() ([]byte, []int) {
-	return file_im_v1_im_proto_rawDescGZIP(), []int{4}
-}
-
-func (x *PushResponse) GetDelivered() bool {
-	if x != nil {
-		return x.Delivered
-	}
-	return false
-}
-
 // Frame 是客户端 WS 二进制帧的唯一格式：oneof 保证一帧只有一种载荷。
 type Frame struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -387,7 +345,7 @@ type Frame struct {
 
 func (x *Frame) Reset() {
 	*x = Frame{}
-	mi := &file_im_v1_im_proto_msgTypes[5]
+	mi := &file_im_v1_im_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -399,7 +357,7 @@ func (x *Frame) String() string {
 func (*Frame) ProtoMessage() {}
 
 func (x *Frame) ProtoReflect() protoreflect.Message {
-	mi := &file_im_v1_im_proto_msgTypes[5]
+	mi := &file_im_v1_im_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -412,7 +370,7 @@ func (x *Frame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Frame.ProtoReflect.Descriptor instead.
 func (*Frame) Descriptor() ([]byte, []int) {
-	return file_im_v1_im_proto_rawDescGZIP(), []int{5}
+	return file_im_v1_im_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *Frame) GetPayload() isFrame_Payload {
@@ -484,7 +442,7 @@ type SyncRequest struct {
 
 func (x *SyncRequest) Reset() {
 	*x = SyncRequest{}
-	mi := &file_im_v1_im_proto_msgTypes[6]
+	mi := &file_im_v1_im_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -496,7 +454,7 @@ func (x *SyncRequest) String() string {
 func (*SyncRequest) ProtoMessage() {}
 
 func (x *SyncRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_im_v1_im_proto_msgTypes[6]
+	mi := &file_im_v1_im_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -509,7 +467,7 @@ func (x *SyncRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncRequest.ProtoReflect.Descriptor instead.
 func (*SyncRequest) Descriptor() ([]byte, []int) {
-	return file_im_v1_im_proto_rawDescGZIP(), []int{6}
+	return file_im_v1_im_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *SyncRequest) GetConvId() string {
@@ -551,7 +509,7 @@ type SyncResponse struct {
 
 func (x *SyncResponse) Reset() {
 	*x = SyncResponse{}
-	mi := &file_im_v1_im_proto_msgTypes[7]
+	mi := &file_im_v1_im_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -563,7 +521,7 @@ func (x *SyncResponse) String() string {
 func (*SyncResponse) ProtoMessage() {}
 
 func (x *SyncResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_im_v1_im_proto_msgTypes[7]
+	mi := &file_im_v1_im_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -576,7 +534,7 @@ func (x *SyncResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncResponse.ProtoReflect.Descriptor instead.
 func (*SyncResponse) Descriptor() ([]byte, []int) {
-	return file_im_v1_im_proto_rawDescGZIP(), []int{7}
+	return file_im_v1_im_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *SyncResponse) GetConvId() string {
@@ -622,9 +580,7 @@ const file_im_v1_im_proto_rawDesc = "" +
 	"\x03seq\x18\x03 \x01(\x04R\x03seq\"S\n" +
 	"\vPushRequest\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\tR\x06userId\x12+\n" +
-	"\benvelope\x18\x02 \x01(\v2\x0f.im.v1.EnvelopeR\benvelope\",\n" +
-	"\fPushResponse\x12\x1c\n" +
-	"\tdelivered\x18\x01 \x01(\bR\tdelivered\"\xa4\x01\n" +
+	"\benvelope\x18\x02 \x01(\v2\x0f.im.v1.EnvelopeR\benvelope\"\xa4\x01\n" +
 	"\x05Frame\x12+\n" +
 	"\amessage\x18\x01 \x01(\v2\x0f.im.v1.EnvelopeH\x00R\amessage\x12/\n" +
 	"\bsync_req\x18\x02 \x01(\v2\x12.im.v1.SyncRequestH\x00R\asyncReq\x122\n" +
@@ -645,9 +601,7 @@ const file_im_v1_im_proto_rawDesc = "" +
 	"\x0fMSG_TYPE_SYSTEM\x10\x022~\n" +
 	"\x05Logic\x12D\n" +
 	"\vSendMessage\x12\x19.im.v1.SendMessageRequest\x1a\x1a.im.v1.SendMessageResponse\x12/\n" +
-	"\x04Sync\x12\x12.im.v1.SyncRequest\x1a\x13.im.v1.SyncResponse2:\n" +
-	"\aGateway\x12/\n" +
-	"\x04Push\x12\x12.im.v1.PushRequest\x1a\x13.im.v1.PushResponseB\rZ\vim/api/imv1b\x06proto3"
+	"\x04Sync\x12\x12.im.v1.SyncRequest\x1a\x13.im.v1.SyncResponseB\rZ\vim/api/imv1b\x06proto3"
 
 var (
 	file_im_v1_im_proto_rawDescOnce sync.Once
@@ -662,37 +616,34 @@ func file_im_v1_im_proto_rawDescGZIP() []byte {
 }
 
 var file_im_v1_im_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_im_v1_im_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_im_v1_im_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_im_v1_im_proto_goTypes = []any{
 	(MsgType)(0),                // 0: im.v1.MsgType
 	(*Envelope)(nil),            // 1: im.v1.Envelope
 	(*SendMessageRequest)(nil),  // 2: im.v1.SendMessageRequest
 	(*SendMessageResponse)(nil), // 3: im.v1.SendMessageResponse
 	(*PushRequest)(nil),         // 4: im.v1.PushRequest
-	(*PushResponse)(nil),        // 5: im.v1.PushResponse
-	(*Frame)(nil),               // 6: im.v1.Frame
-	(*SyncRequest)(nil),         // 7: im.v1.SyncRequest
-	(*SyncResponse)(nil),        // 8: im.v1.SyncResponse
+	(*Frame)(nil),               // 5: im.v1.Frame
+	(*SyncRequest)(nil),         // 6: im.v1.SyncRequest
+	(*SyncResponse)(nil),        // 7: im.v1.SyncResponse
 }
 var file_im_v1_im_proto_depIdxs = []int32{
-	0,  // 0: im.v1.Envelope.type:type_name -> im.v1.MsgType
-	1,  // 1: im.v1.SendMessageRequest.envelope:type_name -> im.v1.Envelope
-	1,  // 2: im.v1.PushRequest.envelope:type_name -> im.v1.Envelope
-	1,  // 3: im.v1.Frame.message:type_name -> im.v1.Envelope
-	7,  // 4: im.v1.Frame.sync_req:type_name -> im.v1.SyncRequest
-	8,  // 5: im.v1.Frame.sync_resp:type_name -> im.v1.SyncResponse
-	1,  // 6: im.v1.SyncResponse.messages:type_name -> im.v1.Envelope
-	2,  // 7: im.v1.Logic.SendMessage:input_type -> im.v1.SendMessageRequest
-	7,  // 8: im.v1.Logic.Sync:input_type -> im.v1.SyncRequest
-	4,  // 9: im.v1.Gateway.Push:input_type -> im.v1.PushRequest
-	3,  // 10: im.v1.Logic.SendMessage:output_type -> im.v1.SendMessageResponse
-	8,  // 11: im.v1.Logic.Sync:output_type -> im.v1.SyncResponse
-	5,  // 12: im.v1.Gateway.Push:output_type -> im.v1.PushResponse
-	10, // [10:13] is the sub-list for method output_type
-	7,  // [7:10] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	0, // 0: im.v1.Envelope.type:type_name -> im.v1.MsgType
+	1, // 1: im.v1.SendMessageRequest.envelope:type_name -> im.v1.Envelope
+	1, // 2: im.v1.PushRequest.envelope:type_name -> im.v1.Envelope
+	1, // 3: im.v1.Frame.message:type_name -> im.v1.Envelope
+	6, // 4: im.v1.Frame.sync_req:type_name -> im.v1.SyncRequest
+	7, // 5: im.v1.Frame.sync_resp:type_name -> im.v1.SyncResponse
+	1, // 6: im.v1.SyncResponse.messages:type_name -> im.v1.Envelope
+	2, // 7: im.v1.Logic.SendMessage:input_type -> im.v1.SendMessageRequest
+	6, // 8: im.v1.Logic.Sync:input_type -> im.v1.SyncRequest
+	3, // 9: im.v1.Logic.SendMessage:output_type -> im.v1.SendMessageResponse
+	7, // 10: im.v1.Logic.Sync:output_type -> im.v1.SyncResponse
+	9, // [9:11] is the sub-list for method output_type
+	7, // [7:9] is the sub-list for method input_type
+	7, // [7:7] is the sub-list for extension type_name
+	7, // [7:7] is the sub-list for extension extendee
+	0, // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_im_v1_im_proto_init() }
@@ -700,7 +651,7 @@ func file_im_v1_im_proto_init() {
 	if File_im_v1_im_proto != nil {
 		return
 	}
-	file_im_v1_im_proto_msgTypes[5].OneofWrappers = []any{
+	file_im_v1_im_proto_msgTypes[4].OneofWrappers = []any{
 		(*Frame_Message)(nil),
 		(*Frame_SyncReq)(nil),
 		(*Frame_SyncResp)(nil),
@@ -711,9 +662,9 @@ func file_im_v1_im_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_im_v1_im_proto_rawDesc), len(file_im_v1_im_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   8,
+			NumMessages:   7,
 			NumExtensions: 0,
-			NumServices:   2,
+			NumServices:   1,
 		},
 		GoTypes:           file_im_v1_im_proto_goTypes,
 		DependencyIndexes: file_im_v1_im_proto_depIdxs,

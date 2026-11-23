@@ -26,6 +26,7 @@ const (
 // conn 的并发模型：readPump 与 writePump 各一个 goroutine。
 // gorilla/websocket 的写不并发安全，所有写操作必须经 sendCh 由 writePump 串行化。
 type conn struct {
+	id        string // 每连接唯一，路由表 field 键；多端共存与精确清理的基础
 	userID    string
 	ws        *websocket.Conn
 	sendCh    chan *imv1.Frame
@@ -35,6 +36,7 @@ type conn struct {
 
 func newConn(userID string, ws *websocket.Conn) *conn {
 	return &conn{
+		id:      newID(),
 		userID:  userID,
 		ws:      ws,
 		sendCh:  make(chan *imv1.Frame, sendQueue),
@@ -63,11 +65,8 @@ func (c *conn) shutdown() {
 	})
 }
 
-func (c *conn) readPump(h *hub, logic imv1.LogicClient) {
-	defer func() {
-		h.remove(c.userID, c)
-		c.shutdown()
-	}()
+func (c *conn) readPump(logic imv1.LogicClient) {
+	defer c.shutdown()
 
 	c.ws.SetReadLimit(maxMsgSize)
 	c.ws.SetReadDeadline(time.Now().Add(pongWait))

@@ -6,62 +6,68 @@ import (
 	"im/api/imv1"
 )
 
-// hub 维护 userID -> 连接 的本地路由表。
-// [PRODUCTION NOTE] M1 用单把 RWMutex；M3 引入分片锁（按 userID 哈希分桶）
-// 降低高并发下的锁竞争，并把"用户在哪台 gateway"上移到 Redis 全局路由表。
+// hub 维护本地路由 uid → 连接集合（多端同步：推送扇出到该用户所有设备）。
+// [PRODUCTION NOTE] 单把 RWMutex，临界区只做快照；M4 压测若显现锁竞争再按 uid 哈希分片。
 type hub struct {
 	mu    sync.RWMutex
-	conns map[string]*conn
+	conns map[string]map[string]*conn // uid → connID → conn
 }
 
 func newHub() *hub {
-	return &hub{conns: make(map[string]*conn)}
+	return &hub{conns: make(map[string]map[string]*conn)}
 }
 
 func (h *hub) register(c *conn) {
 	h.mu.Lock()
-	old := h.conns[c.userID]
-	h.conns[c.userID] = c
-	h.mu.Unlock()
-
-	// [PRODUCTION NOTE] M1 单端在线、新登录踢旧连接；
-	// M3 改为多端同步：uid -> 连接集合，推送扇出到所有设备。
-	if old != nil && old != c {
-		old.shutdown()
+	defer h.mu.Unlock()
+	if h.conns[c.userID] == nil {
+		h.conns[c.userID] = make(map[string]*conn)
 	}
+	h.conns[c.userID][c.id] = c
 }
 
 func (h *hub) remove(userID string, c *conn) {
 	h.mu.Lock()
-	// 只删除自己，避免误删踢旧登录后注册的新连接
-	if h.conns[userID] == c {
-		delete(h.conns, userID)
+	defer h.mu.Unlock()
+	// 只删自己：同 uid 其他设备不受影响
+	if set := h.conns[userID]; set != nil && set[c.id] == c {
+		delete(set, c.id)
+		if len(set) == 0 {
+			delete(h.conns, userID)
+		}
 	}
-	h.mu.Unlock()
 }
 
+// deliver 扇出到该 uid 的所有设备，返回是否至少一台入队成功。
+// 同一 env 指针被多个 writePump 并发 marshal——proto.Marshal 只读，并发安全。
 func (h *hub) deliver(userID string, env *imv1.Envelope) bool {
 	h.mu.RLock()
-	c := h.conns[userID]
+	targets := make([]*conn, 0, len(h.conns[userID]))
+	for _, c := range h.conns[userID] {
+		targets = append(targets, c)
+	}
 	h.mu.RUnlock()
 
-	if c == nil {
-		return false
+	delivered := false
+	for _, c := range targets {
+		if c.trySend(&imv1.Frame{Payload: &imv1.Frame_Message{Message: env}}) {
+			delivered = true
+		} else {
+			c.shutdown() // 背压：消费过慢的设备断开，不拖垮其他设备
+		}
 	}
-	if !c.trySend(&imv1.Frame{Payload: &imv1.Frame_Message{Message: env}}) {
-		c.shutdown()
-		return false
-	}
-	return true
+	return delivered
 }
 
 func (h *hub) closeAll() {
 	h.mu.Lock()
 	conns := h.conns
-	h.conns = make(map[string]*conn)
+	h.conns = make(map[string]map[string]*conn)
 	h.mu.Unlock()
 
-	for _, c := range conns {
-		c.shutdown()
+	for _, set := range conns {
+		for _, c := range set {
+			c.shutdown()
+		}
 	}
 }

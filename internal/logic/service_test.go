@@ -3,45 +3,77 @@ package logic
 import (
 	"context"
 	"errors"
-	"net"
 	"sort"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
 
 	"im/api/imv1"
 	"im/internal/store"
 )
 
-type fakeGateway struct {
-	imv1.UnimplementedGatewayServer
-	mu        sync.Mutex
-	got       []*imv1.PushRequest
-	delivered bool
-	pushErr   error
+// fakeRoutes 内存版路由表：uid → gateway 集合，可注入查询失败。
+type fakeRoutes struct {
+	mu    sync.Mutex
+	byUID map[string][]string
+	err   error
 }
 
-func (f *fakeGateway) Push(ctx context.Context, req *imv1.PushRequest) (*imv1.PushResponse, error) {
+func (f *fakeRoutes) Lookup(ctx context.Context, uid string) ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.got = append(f.got, req)
-	if f.pushErr != nil {
-		return nil, f.pushErr
+	if f.err != nil {
+		return nil, f.err
 	}
-	return &imv1.PushResponse{Delivered: f.delivered}, nil
+	return append([]string(nil), f.byUID[uid]...), nil
 }
 
-func (f *fakeGateway) pushCount() int {
+type pushCall struct {
+	gw    string
+	uid   string
+	msgID string
+	seq   uint64
+}
+
+// fakePublisher 记录每次定向发布的目标频道与载荷，可注入整体或单 gateway 失败。
+type fakePublisher struct {
+	mu     sync.Mutex
+	calls  []pushCall
+	err    error
+	failGW string
+}
+
+func (f *fakePublisher) Publish(ctx context.Context, gw string, req *imv1.PushRequest) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.got)
+	if f.err != nil {
+		return f.err
+	}
+	if gw == f.failGW {
+		return errors.New("gateway channel down")
+	}
+	f.calls = append(f.calls, pushCall{gw: gw, uid: req.UserId, msgID: req.Envelope.MsgId, seq: req.Envelope.Seq})
+	return nil
+}
+
+func (f *fakePublisher) snapshot() []pushCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]pushCall(nil), f.calls...)
+}
+
+func (f *fakePublisher) countFor(uid string) int {
+	n := 0
+	for _, c := range f.snapshot() {
+		if c.uid == uid {
+			n++
+		}
+	}
+	return n
 }
 
 // fakeStore 内存版存储，保留两个唯一索引的冲突语义，可注入任意一步失败。
@@ -126,25 +158,17 @@ func (f *fakeAlloc) Alloc(ctx context.Context, convID string) (int64, error) {
 	return f.counter[convID], nil
 }
 
-// newTestService 用 bufconn 起一个内存 gRPC gateway，返回直连它的 logic Service。
-func newTestService(t *testing.T, gw *fakeGateway, st messageStore, alloc seqAllocator) *Service {
-	t.Helper()
-	lis := bufconn.Listen(1 << 20)
-	gs := grpc.NewServer()
-	imv1.RegisterGatewayServer(gs, gw)
-	go gs.Serve(lis)
-	t.Cleanup(gs.Stop)
+// testRig 默认 alice/bob 各一台设备挂在 gw-1；测试可改 routes.byUID 模拟跨实例/多端/离线。
+type testRig struct {
+	svc    *Service
+	routes *fakeRoutes
+	pub    *fakePublisher
+}
 
-	conn, err := grpc.NewClient("passthrough:///bufnet",
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return lis.DialContext(ctx)
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { conn.Close() })
-	return NewService(imv1.NewGatewayClient(conn), st, alloc)
+func newTestRig(st messageStore, alloc seqAllocator) *testRig {
+	routes := &fakeRoutes{byUID: map[string][]string{"alice": {"gw-1"}, "bob": {"gw-1"}}}
+	pub := &fakePublisher{}
+	return &testRig{svc: NewService(st, alloc, routes, pub), routes: routes, pub: pub}
 }
 
 func textEnv(to string) *imv1.Envelope {
@@ -157,41 +181,86 @@ func send(t *testing.T, svc *Service, env *imv1.Envelope) (*imv1.SendMessageResp
 }
 
 func TestSendMessageDelivered(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
-	resp, err := send(t, svc, textEnv("bob"))
+	resp, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resp.Delivered || resp.MsgId != "m1" || resp.Seq != 1 {
 		t.Fatalf("got %+v", resp)
 	}
-	if gw.pushCount() != 1 {
-		t.Fatalf("want 1 push, got %d", gw.pushCount())
+	// 扇出双方：接收方 bob 一份，发送方 alice 的其他设备一份（多端同步）
+	calls := rig.pub.snapshot()
+	if len(calls) != 2 || rig.pub.countFor("bob") != 1 || rig.pub.countFor("alice") != 1 {
+		t.Fatalf("want one publish per party, got %+v", calls)
 	}
-	gw.mu.Lock()
-	pushed := gw.got[0]
-	gw.mu.Unlock()
-	if pushed.UserId != "bob" || pushed.Envelope.Seq != 1 || pushed.Envelope.TimestampMs == 0 {
-		t.Fatalf("pushed envelope wrong: %+v", pushed)
+	for _, c := range calls {
+		if c.gw != "gw-1" || c.msgID != "m1" || c.seq != 1 {
+			t.Fatalf("pushed payload wrong: %+v", c)
+		}
 	}
 	if m := st.byMsg["p:alice:bob|m1"]; m == nil || m.Seq != 1 || m.Sender != "alice" {
 		t.Fatalf("persisted message wrong: %+v", m)
 	}
 }
 
-func TestConvIDSymmetric(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
-	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+// 跨实例 + 接收方多端：bob 两台设备分属 gw-2/gw-3，alice 在 gw-1，三份定向发布缺一不可。
+func TestFanoutCrossGatewayMultiDevice(t *testing.T) {
+	st := newFakeStore()
+	rig := newTestRig(st, newFakeAlloc())
+	rig.routes.byUID["bob"] = []string{"gw-2", "gw-3"}
 
-	if _, err := send(t, svc, textEnv("bob")); err != nil {
+	resp, err := send(t, rig.svc, textEnv("bob"))
+	if err != nil || !resp.Delivered {
+		t.Fatalf("resp=%+v err=%v", resp, err)
+	}
+	calls := rig.pub.snapshot()
+	if len(calls) != 3 {
+		t.Fatalf("want 3 publishes (bob×2 + alice×1), got %+v", calls)
+	}
+	seen := map[string]bool{}
+	for _, c := range calls {
+		seen[c.gw+"|"+c.uid] = true
+		if c.seq != resp.Seq || c.msgID != "m1" {
+			t.Fatalf("payload wrong: %+v", c)
+		}
+	}
+	for _, want := range []string{"gw-2|bob", "gw-3|bob", "gw-1|alice"} {
+		if !seen[want] {
+			t.Fatalf("missing publish target %s, got %+v", want, calls)
+		}
+	}
+}
+
+// 接收方离线但发送方多端在线：delivered=false，但发送方其他设备仍要收到同步副本。
+func TestSenderMultiDeviceWhenRecipientOffline(t *testing.T) {
+	rig := newTestRig(newFakeStore(), newFakeAlloc())
+	rig.routes.byUID["alice"] = []string{"gw-1", "gw-2"}
+	delete(rig.routes.byUID, "bob")
+
+	resp, err := send(t, rig.svc, textEnv("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Delivered || resp.Seq != 1 {
+		t.Fatalf("offline recipient: delivered=false with seq, got %+v", resp)
+	}
+	if rig.pub.countFor("alice") != 2 || rig.pub.countFor("bob") != 0 {
+		t.Fatalf("sender devices must be synced, got %+v", rig.pub.snapshot())
+	}
+}
+
+func TestConvIDSymmetric(t *testing.T) {
+	st := newFakeStore()
+	rig := newTestRig(st, newFakeAlloc())
+
+	if _, err := send(t, rig.svc, textEnv("bob")); err != nil {
 		t.Fatal(err)
 	}
 	reply := &imv1.Envelope{MsgId: "m2", Type: imv1.MsgType_MSG_TYPE_TEXT, From: "bob", To: "alice", Content: "yo"}
-	resp, err := send(t, svc, reply)
+	resp, err := send(t, rig.svc, reply)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,24 +271,24 @@ func TestConvIDSymmetric(t *testing.T) {
 }
 
 func TestSendMessageOffline(t *testing.T) {
-	gw := &fakeGateway{delivered: false}
-	svc := newTestService(t, gw, newFakeStore(), newFakeAlloc())
+	rig := newTestRig(newFakeStore(), newFakeAlloc())
+	rig.routes.byUID = map[string][]string{} // 双方都不在线
 
-	resp, err := send(t, svc, textEnv("bob"))
+	resp, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Delivered || resp.Seq != 1 {
-		t.Fatalf("offline: stored with seq but delivered=false, got %+v", resp)
+	if resp.Delivered || resp.Seq != 1 || len(rig.pub.snapshot()) != 0 {
+		t.Fatalf("offline: stored with seq, no publishes, got %+v", resp)
 	}
 }
 
 func TestPushFailureIsNotSendFailure(t *testing.T) {
-	gw := &fakeGateway{pushErr: status.Error(codes.Unavailable, "gateway down")}
 	st := newFakeStore()
-	svc := newTestService(t, gw, st, newFakeAlloc())
+	rig := newTestRig(st, newFakeAlloc())
+	rig.pub.err = errors.New("redis down")
 
-	resp, err := send(t, svc, textEnv("bob"))
+	resp, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatalf("push channel failure must not fail the send: %v", err)
 	}
@@ -228,14 +297,50 @@ func TestPushFailureIsNotSendFailure(t *testing.T) {
 	}
 }
 
+// 接收方所在 gateway 频道故障：delivered=false，但发送方副本照常发布（部分失败不扩散）。
+func TestPartialPublishFailure(t *testing.T) {
+	rig := newTestRig(newFakeStore(), newFakeAlloc())
+	rig.routes.byUID["bob"] = []string{"gw-2"}
+	rig.pub.failGW = "gw-2"
+
+	resp, err := send(t, rig.svc, textEnv("bob"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Delivered || resp.Seq != 1 {
+		t.Fatalf("recipient channel down: delivered=false, got %+v", resp)
+	}
+	if rig.pub.countFor("alice") != 1 || rig.pub.countFor("bob") != 0 {
+		t.Fatalf("sender copy must survive partial failure, got %+v", rig.pub.snapshot())
+	}
+}
+
+// 路由查询失败只降级推送，绝不失败发送——真相已落库，SYNC 兜底。
+func TestRouteLookupFailureDoesNotFailSend(t *testing.T) {
+	st := newFakeStore()
+	rig := newTestRig(st, newFakeAlloc())
+	rig.routes.err = errors.New("redis down")
+
+	resp, err := send(t, rig.svc, textEnv("bob"))
+	if err != nil {
+		t.Fatalf("route lookup failure must not fail the send: %v", err)
+	}
+	if resp.Delivered || resp.Seq != 1 || st.byMsg["p:alice:bob|m1"] == nil {
+		t.Fatalf("persisted despite lookup failure, resp=%+v", resp)
+	}
+	if len(rig.pub.snapshot()) != 0 {
+		t.Fatal("no publish possible when lookup fails")
+	}
+}
+
 func TestInvalidEnvelope(t *testing.T) {
-	svc := newTestService(t, &fakeGateway{delivered: true}, newFakeStore(), newFakeAlloc())
+	rig := newTestRig(newFakeStore(), newFakeAlloc())
 	for _, env := range []*imv1.Envelope{
 		{Type: imv1.MsgType_MSG_TYPE_TEXT, From: "alice"},                    // 缺 to
 		{Type: imv1.MsgType_MSG_TYPE_TEXT, From: "alice", To: "bob"},         // 缺 msg_id
 		{MsgId: "m1", Type: imv1.MsgType_MSG_TYPE_SYSTEM, From: "a", To: "b"}, // 非法类型
 	} {
-		_, err := send(t, svc, env)
+		_, err := send(t, rig.svc, env)
 		if status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("want InvalidArgument for %+v, got %v", env, err)
 		}
@@ -244,20 +349,19 @@ func TestInvalidEnvelope(t *testing.T) {
 
 // 思考题场景：领号成功但落库失败 → 重试领新号，旧号成空洞，不重号。
 func TestRetryAfterPersistFailureGetsNewSeq(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
 	st.insertErr = errors.New("db down")
-	if _, err := send(t, svc, textEnv("bob")); status.Code(err) != codes.Internal {
+	if _, err := send(t, rig.svc, textEnv("bob")); status.Code(err) != codes.Internal {
 		t.Fatalf("persist failure must fail the send, got %v", err)
 	}
-	if gw.pushCount() != 0 {
+	if len(rig.pub.snapshot()) != 0 {
 		t.Fatal("must NOT push when persist failed")
 	}
 
 	st.insertErr = nil
-	resp, err := send(t, svc, textEnv("bob"))
+	resp, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,29 +375,28 @@ func TestRetryAfterPersistFailureGetsNewSeq(t *testing.T) {
 
 // 落库成功但响应丢失 → 重试幂等返回原 seq，不领新号、不重复推送。
 func TestRetryAfterSuccessIsIdempotent(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
-	r1, err := send(t, svc, textEnv("bob"))
+	r1, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := send(t, svc, textEnv("bob"))
+	pushesAfterFirst := len(rig.pub.snapshot())
+	r2, err := send(t, rig.svc, textEnv("bob"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r1.Seq != r2.Seq || alloc.calls != 1 || gw.pushCount() != 1 || len(st.byMsg) != 1 {
+	if r1.Seq != r2.Seq || alloc.calls != 1 || len(rig.pub.snapshot()) != pushesAfterFirst || len(st.byMsg) != 1 {
 		t.Fatalf("retry must be idempotent: r1=%+v r2=%+v allocCalls=%d pushes=%d rows=%d",
-			r1, r2, alloc.calls, gw.pushCount(), len(st.byMsg))
+			r1, r2, alloc.calls, len(rig.pub.snapshot()), len(st.byMsg))
 	}
 }
 
 // 并发重试竞态：查重落空后另一请求先插入，INSERT 撞 uk_conv_msg → 返回已有 seq。
 func TestConcurrentSameMsgIDOneSeq(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
-	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+	st := newFakeStore()
+	rig := newTestRig(st, newFakeAlloc())
 
 	const n = 8
 	seqs := make([]uint64, n)
@@ -303,7 +406,7 @@ func TestConcurrentSameMsgIDOneSeq(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := send(t, svc, textEnv("bob"))
+			resp, err := send(t, rig.svc, textEnv("bob"))
 			if err != nil {
 				errs[i] = err
 				return
@@ -320,59 +423,58 @@ func TestConcurrentSameMsgIDOneSeq(t *testing.T) {
 			t.Fatalf("all retries must converge to one seq, got %v", seqs)
 		}
 	}
-	if len(st.byMsg) != 1 || gw.pushCount() != 1 {
-		t.Fatalf("one row one push, got rows=%d pushes=%d", len(st.byMsg), gw.pushCount())
+	// 只有一条消息落库 → 只有一轮扇出（双方各一份）
+	if len(st.byMsg) != 1 || len(rig.pub.snapshot()) != 2 {
+		t.Fatalf("one row one fanout round, got rows=%d pushes=%d", len(st.byMsg), len(rig.pub.snapshot()))
 	}
 }
 
 func TestDedupQueryFailureFailsSend(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
 	st.getErr = errors.New("db down")
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
-	if _, err := send(t, svc, textEnv("bob")); status.Code(err) != codes.Internal {
+	if _, err := send(t, rig.svc, textEnv("bob")); status.Code(err) != codes.Internal {
 		t.Fatalf("want Internal, got %v", err)
 	}
-	if alloc.calls != 0 || gw.pushCount() != 0 {
+	if alloc.calls != 0 || len(rig.pub.snapshot()) != 0 {
 		t.Fatal("must not alloc or push when dedup query fails")
 	}
 }
 
 func TestAllocFailureFailsSend(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
 	alloc.err = errors.New("redis down")
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
-	if _, err := send(t, svc, textEnv("bob")); status.Code(err) != codes.Internal {
+	if _, err := send(t, rig.svc, textEnv("bob")); status.Code(err) != codes.Internal {
 		t.Fatalf("want Internal, got %v", err)
 	}
-	if len(st.byMsg) != 0 || gw.pushCount() != 0 {
+	if len(st.byMsg) != 0 || len(rig.pub.snapshot()) != 0 {
 		t.Fatal("must not persist or push when alloc fails")
 	}
 }
 
 // 防线场景：发号器异常发出已占用的 seq → uk_conv_seq 拒绝，告警且不推送。
 func TestSeqCollisionDefense(t *testing.T) {
-	gw := &fakeGateway{delivered: true}
 	st, alloc := newFakeStore(), newFakeAlloc()
-	svc := newTestService(t, gw, st, alloc)
+	rig := newTestRig(st, alloc)
 
 	other := &imv1.Envelope{MsgId: "other", Type: imv1.MsgType_MSG_TYPE_TEXT, From: "alice", To: "bob", Content: "first"}
-	if _, err := send(t, svc, other); err != nil {
+	if _, err := send(t, rig.svc, other); err != nil {
 		t.Fatal(err)
 	}
+	pushesAfterFirst := len(rig.pub.snapshot())
 	// 模拟发号器回退：再次发出 1
 	alloc.mu.Lock()
 	alloc.counter["p:alice:bob"] = 0
 	alloc.mu.Unlock()
 
-	if _, err := send(t, svc, textEnv("bob")); status.Code(err) != codes.Internal {
+	if _, err := send(t, rig.svc, textEnv("bob")); status.Code(err) != codes.Internal {
 		t.Fatalf("seq collision must fail the send, got %v", err)
 	}
-	if gw.pushCount() != 1 {
-		t.Fatalf("colliding message must not be pushed, pushes=%d", gw.pushCount())
+	if len(rig.pub.snapshot()) != pushesAfterFirst {
+		t.Fatalf("colliding message must not be pushed, pushes=%d", len(rig.pub.snapshot()))
 	}
 }
 
@@ -394,14 +496,14 @@ func seedMessages(t *testing.T, st *fakeStore, conv string, n int) {
 }
 
 func TestSyncRejectsNonMember(t *testing.T) {
-	svc := newTestService(t, &fakeGateway{}, newFakeStore(), newFakeAlloc())
+	rig := newTestRig(newFakeStore(), newFakeAlloc())
 	for _, req := range []*imv1.SyncRequest{
 		{ConvId: "p:alice:bob", UserId: "mallory"}, // 越权：不是会话成员
 		{ConvId: "p:alice:bob"},                    // 缺身份
 		{ConvId: "g:123", UserId: "alice"},         // M4 群聊格式，暂不支持
 		{ConvId: "garbage", UserId: "alice"},
 	} {
-		_, err := svc.Sync(context.Background(), req)
+		_, err := rig.svc.Sync(context.Background(), req)
 		if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.InvalidArgument {
 			t.Fatalf("req %+v: want PermissionDenied/InvalidArgument, got %v", req, err)
 		}
@@ -411,9 +513,9 @@ func TestSyncRejectsNonMember(t *testing.T) {
 func TestSyncPaginationAndHasMore(t *testing.T) {
 	st := newFakeStore()
 	seedMessages(t, st, "p:alice:bob", 6)
-	svc := newTestService(t, &fakeGateway{}, st, newFakeAlloc())
+	rig := newTestRig(st, newFakeAlloc())
 
-	r1, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 0, Limit: 3})
+	r1, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 0, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +527,7 @@ func TestSyncPaginationAndHasMore(t *testing.T) {
 		t.Fatalf("envelope conversion wrong: %+v", r1.Messages)
 	}
 
-	r2, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 3, Limit: 3})
+	r2, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 3, Limit: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,7 +535,7 @@ func TestSyncPaginationAndHasMore(t *testing.T) {
 		t.Fatalf("page2 wrong: %+v", r2)
 	}
 
-	r3, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 6, Limit: 3})
+	r3, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "bob", Since: 6, Limit: 3})
 	if err != nil || len(r3.Messages) != 0 || r3.HasMore {
 		t.Fatalf("caught up: %+v err=%v", r3, err)
 	}
@@ -441,15 +543,15 @@ func TestSyncPaginationAndHasMore(t *testing.T) {
 
 func TestSyncLimitClamped(t *testing.T) {
 	st := newFakeStore()
-	svc := newTestService(t, &fakeGateway{}, st, newFakeAlloc())
+	rig := newTestRig(st, newFakeAlloc())
 
-	if _, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice"}); err != nil {
+	if _, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice"}); err != nil {
 		t.Fatal(err)
 	}
 	if st.lastLimit != defaultSyncLimit+1 {
 		t.Fatalf("default limit: query limit=%d, want %d", st.lastLimit, defaultSyncLimit+1)
 	}
-	if _, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice", Limit: 99999}); err != nil {
+	if _, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice", Limit: 99999}); err != nil {
 		t.Fatal(err)
 	}
 	if st.lastLimit != maxSyncLimit+1 {
@@ -460,8 +562,8 @@ func TestSyncLimitClamped(t *testing.T) {
 func TestSyncQueryFailure(t *testing.T) {
 	st := newFakeStore()
 	st.listErr = errors.New("db down")
-	svc := newTestService(t, &fakeGateway{}, st, newFakeAlloc())
-	_, err := svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice"})
+	rig := newTestRig(st, newFakeAlloc())
+	_, err := rig.svc.Sync(context.Background(), &imv1.SyncRequest{ConvId: "p:alice:bob", UserId: "alice"})
 	if status.Code(err) != codes.Internal {
 		t.Fatalf("want Internal, got %v", err)
 	}

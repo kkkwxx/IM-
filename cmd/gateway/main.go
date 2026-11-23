@@ -8,12 +8,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"im/api/imv1"
 	"im/internal/config"
 	"im/internal/gateway"
+	"im/internal/route"
 )
 
 func main() {
@@ -36,10 +38,18 @@ func main() {
 	}
 	defer logicConn.Close()
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.Gateway.RedisAddr})
+	defer rdb.Close()
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		slog.Error("ping redis", "err", err)
+		os.Exit(1)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv := gateway.NewServer(cfg.Gateway, imv1.NewLogicClient(logicConn))
+	srv := gateway.NewServer(cfg.Gateway, imv1.NewLogicClient(logicConn), []byte(cfg.JWTSecret),
+		route.New(rdb, route.DefaultTTL), rdb)
 	if err := srv.Run(ctx); err != nil {
 		slog.Error("gateway run", "err", err)
 		os.Exit(1)

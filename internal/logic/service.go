@@ -26,17 +26,26 @@ type seqAllocator interface {
 	Alloc(ctx context.Context, convID string) (int64, error)
 }
 
+type routeLookup interface {
+	Lookup(ctx context.Context, uid string) ([]string, error)
+}
+
+type publisher interface {
+	Publish(ctx context.Context, gatewayAddr string, req *imv1.PushRequest) error
+}
+
 // Service 是业务层，承担可靠投递核心：先持久化并分配会话级 seq，再推送。
 // 推送失败不影响可靠性，接收方上线后按 seq 增量同步补齐。
 type Service struct {
 	imv1.UnimplementedLogicServer
-	gateway imv1.GatewayClient
-	store   messageStore
-	alloc   seqAllocator
+	store  messageStore
+	alloc  seqAllocator
+	routes routeLookup
+	pub    publisher
 }
 
-func NewService(gateway imv1.GatewayClient, st messageStore, alloc seqAllocator) *Service {
-	return &Service{gateway: gateway, store: st, alloc: alloc}
+func NewService(st messageStore, alloc seqAllocator, routes routeLookup, pub publisher) *Service {
+	return &Service{store: st, alloc: alloc, routes: routes, pub: pub}
 }
 
 // convID 单聊会话键：双方 uid 排序拼接，保证 alice→bob 与 bob→alice 落在同一会话。
@@ -107,12 +116,32 @@ func (s *Service) SendMessage(ctx context.Context, req *imv1.SendMessageRequest)
 	// 4. 推送：尽力而为的通知通道，失败仅记录，可靠性由落库+seq 同步保证。
 	pushCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	resp, err := s.gateway.Push(pushCtx, &imv1.PushRequest{UserId: env.To, Envelope: env})
-	if err != nil {
-		slog.Error("push to gateway failed", "to", env.To, "err", err)
-		return &imv1.SendMessageResponse{MsgId: env.MsgId, Seq: uint64(seq), Delivered: false}, nil
+	delivered := s.fanout(pushCtx, env)
+	return &imv1.SendMessageResponse{MsgId: env.MsgId, Seq: uint64(seq), Delivered: delivered}, nil
+}
+
+// fanout 查接收方与发送方双方的路由，向每台目标 gateway 的专属频道发布。
+// 发送方也要查：其所有设备（含发送设备本人）都应收到这条消息，实现多端同步；
+// 发送设备会同时收到本地回执与扇出副本，客户端按 seq 去重（M2.5 已具备）。
+func (s *Service) fanout(ctx context.Context, env *imv1.Envelope) bool {
+	delivered := false
+	for _, uid := range []string{env.To, env.From} {
+		gws, err := s.routes.Lookup(ctx, uid)
+		if err != nil {
+			slog.Error("route lookup failed", "uid", uid, "err", err)
+			continue
+		}
+		for _, gw := range gws {
+			if err := s.pub.Publish(ctx, gw, &imv1.PushRequest{UserId: uid, Envelope: env}); err != nil {
+				slog.Error("publish failed", "gw", gw, "uid", uid, "err", err)
+				continue
+			}
+			if uid == env.To {
+				delivered = true
+			}
+		}
 	}
-	return &imv1.SendMessageResponse{MsgId: env.MsgId, Seq: uint64(seq), Delivered: resp.Delivered}, nil
+	return delivered
 }
 
 var _ imv1.LogicServer = (*Service)(nil)
@@ -184,6 +213,6 @@ func (s *Service) Sync(ctx context.Context, req *imv1.SyncRequest) (*imv1.SyncRe
 }
 
 // Register 把业务服务挂到 gRPC server。
-func Register(srv *grpc.Server, gateway imv1.GatewayClient, st messageStore, alloc seqAllocator) {
-	imv1.RegisterLogicServer(srv, NewService(gateway, st, alloc))
+func Register(srv *grpc.Server, st messageStore, alloc seqAllocator, routes routeLookup, pub publisher) {
+	imv1.RegisterLogicServer(srv, NewService(st, alloc, routes, pub))
 }

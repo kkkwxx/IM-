@@ -8,20 +8,22 @@ import (
 
 type Gateway struct {
 	WSAddr        string `json:"ws_addr"`
-	GRPCAddr      string `json:"grpc_addr"`
+	Addr          string `json:"addr"` // 实例标识：路由表值与 Pub/Sub 频道名，M3 起不再监听 gRPC
 	LogicGRPCAddr string `json:"logic_grpc_addr"`
+	RedisAddr     string `json:"redis_addr"`
 }
 
 type Logic struct {
-	GRPCAddr        string `json:"grpc_addr"`
-	GatewayGRPCAddr string `json:"gateway_grpc_addr"`
-	MySQLDSN        string `json:"mysql_dsn"`
-	RedisAddr       string `json:"redis_addr"`
+	GRPCAddr  string `json:"grpc_addr"`
+	HTTPAddr  string `json:"http_addr"`
+	MySQLDSN  string `json:"mysql_dsn"`
+	RedisAddr string `json:"redis_addr"`
 }
 
 type Config struct {
-	Gateway Gateway `json:"gateway"`
-	Logic   Logic   `json:"logic"`
+	Gateway   Gateway `json:"gateway"`
+	Logic     Logic   `json:"logic"`
+	JWTSecret string  `json:"jwt_secret"` // gateway 验签与 logic 签发共享
 }
 
 // Load 读取 JSON 配置。
